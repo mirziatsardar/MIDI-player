@@ -43,7 +43,7 @@
   },
   "build": {
     "appId": "com.midi.ma.app",
-    "productName": "MIDI MA Player",
+    "productName": "Universal Show Console",
     "directories": {
       "output": "dist-electron"
     },
