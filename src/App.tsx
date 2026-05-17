@@ -54,6 +54,8 @@ export default function App() {
   const cuesRef = useRef<MidiCue[]>([]);
   const [logs, setLogs] = useState<{id: string, msg: string}[]>([]);
 
+  const [mtcEnabled, setMtcEnabled] = useState<boolean>(true);
+
   const requestRef = useRef<number>();
   const lastTimeRef = useRef<number>(0);
   const lastTickTimeRef = useRef<number>(0);
@@ -63,6 +65,13 @@ export default function App() {
   const activeTrackIdRef = useRef<string | null>(null);
   const isPlayingRef = useRef<boolean>(false);
   const selectedOutputRef = useRef<string>('');
+  const mtcEnabledRef = useRef<boolean>(true);
+  const mtcTimerRef = useRef<number | null>(null);
+  const mtcQfIndexRef = useRef<number>(0);
+
+  useEffect(() => {
+      mtcEnabledRef.current = mtcEnabled;
+  }, [mtcEnabled]);
 
   useEffect(() => {
       activeTrackIdRef.current = activeTrackId;
@@ -90,6 +99,7 @@ export default function App() {
   useEffect(() => {
     return () => {
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (mtcTimerRef.current) clearInterval(mtcTimerRef.current);
     }
   }, []);
 
@@ -187,6 +197,73 @@ export default function App() {
           isPlayingRef.current = false;
           setMasterTime(0);
           masterTimeRef.current = 0;
+          stopMTC();
+      }
+  };
+
+  const startMTC = () => {
+      if (mtcTimerRef.current) clearInterval(mtcTimerRef.current);
+      mtcQfIndexRef.current = 0;
+      
+      mtcTimerRef.current = window.setInterval(() => {
+           if (!isPlayingRef.current || !mtcEnabledRef.current) return;
+           if (WebMidi.enabled && selectedOutputRef.current) {
+               const output = WebMidi.getOutputById(selectedOutputRef.current);
+               if (output) {
+                   const timeInSeconds = masterTimeRef.current;
+                   let totalFrames = Math.floor(timeInSeconds * 30);
+                   let frames = totalFrames % 30;
+                   let totalSeconds = Math.floor(totalFrames / 30);
+                   let seconds = totalSeconds % 60;
+                   let totalMinutes = Math.floor(totalSeconds / 60);
+                   let minutes = totalMinutes % 60;
+                   let hours = Math.floor(totalMinutes / 60) % 24;
+
+                   let data = 0;
+                   switch (mtcQfIndexRef.current) {
+                       case 0: data = frames & 0x0F; break;
+                       case 1: data = (frames >> 4) & 0x01; break;
+                       case 2: data = seconds & 0x0F; break;
+                       case 3: data = (seconds >> 4) & 0x03; break;
+                       case 4: data = minutes & 0x0F; break;
+                       case 5: data = (minutes >> 4) & 0x03; break;
+                       case 6: data = hours & 0x0F; break;
+                       case 7: data = 6 | ((hours >> 4) & 0x01); break; // rate 30fps
+                   }
+
+                   try {
+                       output.send([0xF1, (mtcQfIndexRef.current << 4) | data]);
+                   } catch(e) {}
+                   
+                   mtcQfIndexRef.current = (mtcQfIndexRef.current + 1) % 8;
+               }
+           }
+      }, 1000 / 120);
+  };
+
+  const stopMTC = () => {
+      if (mtcTimerRef.current) {
+          clearInterval(mtcTimerRef.current);
+          mtcTimerRef.current = null;
+      }
+  };
+
+  const sendMtcFullFrame = (timeInSeconds: number) => {
+      if (WebMidi.enabled && selectedOutputRef.current && mtcEnabledRef.current) {
+          const output = WebMidi.getOutputById(selectedOutputRef.current);
+          if (output) {
+              let totalFrames = Math.floor(timeInSeconds * 30);
+              let frames = totalFrames % 30;
+              let totalSeconds = Math.floor(totalFrames / 30);
+              let seconds = totalSeconds % 60;
+              let totalMinutes = Math.floor(totalSeconds / 60);
+              let minutes = totalMinutes % 60;
+              let hours = Math.floor(totalMinutes / 60) % 24;
+              
+              try {
+                  output.sendSysex(0x7F, [0x7F, 0x01, 0x01, 0x60 | hours, minutes, seconds, frames]);
+              } catch(e) {}
+          }
       }
   };
 
@@ -214,6 +291,9 @@ export default function App() {
       
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
       requestRef.current = requestAnimationFrame(checkTimeline);
+      
+      sendMtcFullFrame(track.startTime);
+      startMTC();
   };
 
   const togglePlay = () => {
@@ -233,12 +313,15 @@ export default function App() {
           setIsPlaying(false);
           isPlayingRef.current = false;
           if (requestRef.current) cancelAnimationFrame(requestRef.current);
+          stopMTC();
       } else {
           lastTickTimeRef.current = performance.now();
           activeTrack.audio.play().catch(e => console.log(e));
           setIsPlaying(true);
           isPlayingRef.current = true;
           requestRef.current = requestAnimationFrame(checkTimeline);
+          sendMtcFullFrame(masterTimeRef.current);
+          startMTC();
       }
   };
 
@@ -246,6 +329,7 @@ export default function App() {
       setIsPlaying(false);
       isPlayingRef.current = false;
       if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      stopMTC();
       
       const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current);
       if (track) {
@@ -253,9 +337,11 @@ export default function App() {
           track.audio.currentTime = 0;
           setMasterTime(track.startTime);
           masterTimeRef.current = track.startTime;
+          sendMtcFullFrame(track.startTime);
       } else {
           setMasterTime(0);
           masterTimeRef.current = 0;
+          sendMtcFullFrame(0);
       }
   };
 
@@ -269,6 +355,8 @@ export default function App() {
       
       setMasterTime(newMasterTime);
       masterTimeRef.current = newMasterTime;
+      
+      sendMtcFullFrame(newMasterTime);
   };
 
   const checkTimeline = () => {
@@ -281,6 +369,7 @@ export default function App() {
           setIsPlaying(false);
           isPlayingRef.current = false;
           setMasterTime(track.startTime + track.duration);
+          stopMTC();
           return;
       }
 
@@ -380,9 +469,20 @@ export default function App() {
                   </button>
                ) : (
                   <div>
-                    <label className="text-[10px] text-[#666] uppercase tracking-widest flex items-center mb-2">
-                      Primary Hardware Output
-                    </label>
+                    <div className="flex items-center justify-between mb-2">
+                        <label className="text-[10px] text-[#666] uppercase tracking-widest flex items-center">
+                          Primary Hardware Output
+                        </label>
+                        <label className="flex items-center gap-1.5 cursor-pointer group">
+                           <span className="text-[9px] text-[#888] font-mono group-hover:text-[#AAA]">SEND MTC 30FPS</span>
+                           <input 
+                              type="checkbox" 
+                              checked={mtcEnabled} 
+                              onChange={(e) => setMtcEnabled(e.target.checked)} 
+                              className="accent-[#FF4E00] cursor-pointer"
+                           />
+                        </label>
+                    </div>
                     <select 
                       value={selectedOutput}
                       onChange={(e) => setSelectedOutput(e.target.value)}
