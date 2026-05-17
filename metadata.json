@@ -1,0 +1,10 @@
+{
+  "name": "Universal Show Console",
+  "description": "A universal music player that triggers MIDI events synced to audio playback for show control and lighting consoles.",
+  "requestFramePermissions": [
+    "midi"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
