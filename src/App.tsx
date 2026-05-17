@@ -1,14 +1,23 @@
 import React, { useEffect, useState, useRef } from 'react';
 import { WebMidi, Output } from 'webmidi';
-import { Settings, Play, Pause, Square, Music, Activity, Trash2, Plus } from 'lucide-react';
+import { Settings, Play, Pause, Square, Music, Activity, Trash2, Plus, Clock, FileAudio } from 'lucide-react';
 
 type MidiCue = {
   id: string;
-  time: number; // in seconds
+  time: number; // in seconds (Global Master Time)
   action: 'noteon' | 'cc';
   channel: number;
   data1: string; // note name or CC number
   data2: number; // velocity or CC value
+};
+
+type Track = {
+  id: string;
+  name: string;
+  url: string;
+  startTime: number; // Global start time in seconds
+  duration: number;
+  audio: HTMLAudioElement;
 };
 
 const formatTime = (timeInSeconds: number) => {
@@ -18,12 +27,19 @@ const formatTime = (timeInSeconds: number) => {
     return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(2, '0')}`;
 };
 
+const parseTime = (timeString: string): number => {
+    const parts = timeString.split(':');
+    if (parts.length === 2) {
+      const mins = parseInt(parts[0], 10);
+      const secs = parseFloat(parts[1]);
+      return (mins * 60) + secs;
+    }
+    return parseFloat(timeString) || 0;
+};
+
 export default function App() {
-  const audioRef = useRef<HTMLAudioElement>(null);
-  const [audioSrc, setAudioSrc] = useState<string>('');
-  const [fileName, setFileName] = useState<string>('');
-  const [duration, setDuration] = useState<number>(0);
-  const [currentTime, setCurrentTime] = useState<number>(0);
+  const [tracks, setTracks] = useState<Track[]>([]);
+  const [masterTime, setMasterTime] = useState<number>(0);
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [vol, setVol] = useState<number>(100);
 
@@ -38,30 +54,32 @@ export default function App() {
 
   const requestRef = useRef<number>();
   const lastTimeRef = useRef<number>(0);
+  const lastTickTimeRef = useRef<number>(0);
+  const tracksRef = useRef<Track[]>([]);
 
-  // Sync cues to ref for use in animation frame
   useEffect(() => {
      cuesRef.current = cues;
   }, [cues]);
 
-  // Volume effect
   useEffect(() => {
-     if (audioRef.current) {
-         audioRef.current.volume = vol / 100;
-     }
-  }, [vol]);
+     tracksRef.current = tracks;
+  }, [tracks]);
+
+  useEffect(() => {
+     tracks.forEach(track => {
+         track.audio.volume = vol / 100;
+     });
+  }, [vol, tracks]);
 
   const initMidi = async () => {
     WebMidi.enable({ sysex: true })
       .then(() => {
         setMidiEnabled(true);
         setError(null);
-        
         setOutputs(WebMidi.outputs);
         if (WebMidi.outputs.length > 0) {
           setSelectedOutput(WebMidi.outputs[0].id);
         }
-
         WebMidi.addListener('connected', () => setOutputs(WebMidi.outputs));
         WebMidi.addListener('disconnected', () => {
           setOutputs(WebMidi.outputs);
@@ -76,64 +94,130 @@ export default function App() {
   };
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (file) {
-          stopPlay();
+      const files = e.target.files;
+      if (!files) return;
+      
+      const newTracks: Track[] = [];
+      let defaultStart = tracks.length > 0 
+          ? Math.max(...tracks.map(t => t.startTime + t.duration)) 
+          : 0;
+
+      // Allow up to 30 tracks
+      const remainingSlots = 30 - tracks.length;
+      const filesToProcess = Array.from(files).slice(0, remainingSlots);
+
+      filesToProcess.forEach(file => {
           const url = URL.createObjectURL(file);
-          setAudioSrc(url);
-          setFileName(file.name);
-          if (audioRef.current) {
-              audioRef.current.src = url;
-              audioRef.current.load();
+          const audio = new Audio(url);
+          audio.volume = vol / 100;
+          
+          const track: Track = {
+              id: Math.random().toString(36).substr(2, 9),
+              name: file.name,
+              url,
+              startTime: defaultStart,
+              duration: 0,
+              audio
+          };
+          
+          audio.onloadedmetadata = () => {
+              setTracks(prev => prev.map(t => t.id === track.id ? { ...t, duration: t.audio.duration } : t));
+          };
+          
+          newTracks.push(track);
+          defaultStart += 300; // rough 5 min spacing before load finishes (will adjust manually)
+      });
+      
+      setTracks(prev => [...prev, ...newTracks]);
+  };
+
+  const updateTrackStart = (id: string, newStartStr: string) => {
+      const newStart = parseTime(newStartStr);
+      setTracks(prev => prev.map(t => t.id === id ? { ...t, startTime: newStart } : t));
+  };
+  
+  const removeTrack = (id: string) => {
+      setTracks(prev => {
+          const track = prev.find(t => t.id === id);
+          if (track) {
+              track.audio.pause();
+              URL.revokeObjectURL(track.url);
           }
-      }
+          return prev.filter(t => t.id !== id);
+      });
   };
 
   const togglePlay = () => {
-      if (!audioRef.current || !audioSrc) return;
       if (isPlaying) {
-          audioRef.current.pause();
           setIsPlaying(false);
+          tracksRef.current.forEach(t => t.audio.pause());
       } else {
-          audioRef.current.play();
+          lastTickTimeRef.current = performance.now();
           setIsPlaying(true);
       }
   };
 
   const stopPlay = () => {
-      if (!audioRef.current) return;
-      audioRef.current.pause();
-      audioRef.current.currentTime = 0;
       setIsPlaying(false);
-      setCurrentTime(0);
+      setMasterTime(0);
       lastTimeRef.current = 0;
+      tracksRef.current.forEach(t => {
+          t.audio.pause();
+          t.audio.currentTime = 0;
+      });
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
       const time = parseFloat(e.target.value);
-      if (audioRef.current) {
-          audioRef.current.currentTime = time;
-      }
-      setCurrentTime(time);
+      setMasterTime(time);
       lastTimeRef.current = time;
+      
+      tracksRef.current.forEach(t => {
+          if (time >= t.startTime && time < t.startTime + t.duration) {
+              t.audio.currentTime = time - t.startTime;
+              if (isPlaying) t.audio.play().catch(e => console.log(e));
+          } else {
+              t.audio.pause();
+          }
+      });
   };
 
-  // Main playback loop
-  const checkCues = () => {
-      if (!audioRef.current) return;
-      const time = audioRef.current.currentTime;
-      const lastTime = lastTimeRef.current;
-      setCurrentTime(time);
+  const checkTimeline = () => {
+      if (!isPlaying) return;
       
-      // Fire Cues if playing forward within normal delta
-      if (time > lastTime && time - lastTime < 1 && WebMidi.enabled && selectedOutput) {
+      const now = performance.now();
+      const delta = (now - lastTickTimeRef.current) / 1000;
+      lastTickTimeRef.current = now;
+      
+      const nextTime = masterTime + delta;
+      
+      // Update Audio playback
+      tracksRef.current.forEach(t => {
+          const isTimeInTrack = nextTime >= t.startTime && nextTime < t.startTime + t.duration;
+          const wasInTrack = masterTime >= t.startTime && masterTime < t.startTime + t.duration;
+          
+          if (isTimeInTrack) {
+              if (t.audio.paused) {
+                  t.audio.currentTime = nextTime - t.startTime;
+                  t.audio.play().catch(e => console.log("Audio play error", e));
+              } else {
+                  // Sync check to prevent drift
+                  const expectedTime = nextTime - t.startTime;
+                  if (Math.abs(t.audio.currentTime - expectedTime) > 0.2) {
+                      t.audio.currentTime = expectedTime;
+                  }
+              }
+          } else if (wasInTrack) {
+              t.audio.pause();
+          }
+      });
+
+      // Fire MIDI Cues
+      if (WebMidi.enabled && selectedOutput) {
            const output = WebMidi.getOutputById(selectedOutput);
-           let triggeredAny = false;
-           
            if (output) {
                cuesRef.current.forEach(cue => {
-                    if (cue.time > lastTime && cue.time <= time) {
-                         triggeredAny = true;
+                    if (cue.time > masterTime && cue.time <= nextTime) {
                          const ch = output.channels[cue.channel];
                          try {
                              if (cue.action === 'noteon') {
@@ -141,10 +225,8 @@ export default function App() {
                              } else if (cue.action === 'cc') {
                                  ch.sendControlChange(Number(cue.data1), cue.data2);
                              }
-                             
-                             // Add to log
                              setLogs(prev => [
-                                 { id: Math.random().toString(), msg: `[${formatTime(time)}] CH${cue.channel} ${cue.action} ${cue.data1} V:${cue.data2}` },
+                                 { id: Math.random().toString(), msg: `[${formatTime(nextTime)}] CH${cue.channel} ${cue.action} ${cue.data1} V:${cue.data2}` },
                                  ...prev
                              ].slice(0, 20));
                          } catch(e) {
@@ -155,25 +237,26 @@ export default function App() {
            }
       }
       
-      lastTimeRef.current = time;
-      requestRef.current = requestAnimationFrame(checkCues);
+      setMasterTime(nextTime);
+      lastTimeRef.current = nextTime;
+      requestRef.current = requestAnimationFrame(checkTimeline);
   };
 
   useEffect(() => {
       if (isPlaying) {
-          requestRef.current = requestAnimationFrame(checkCues);
+          requestRef.current = requestAnimationFrame(checkTimeline);
       } else {
           if (requestRef.current) cancelAnimationFrame(requestRef.current);
       }
       return () => {
           if (requestRef.current) cancelAnimationFrame(requestRef.current);
       }
-  }, [isPlaying, selectedOutput]);
+  }, [isPlaying, masterTime, selectedOutput]);
 
   const addCue = () => {
       const newCue: MidiCue = {
           id: Math.random().toString(36).substr(2, 9),
-          time: parseFloat(currentTime.toFixed(3)),
+          time: parseFloat(masterTime.toFixed(3)),
           action: 'noteon',
           channel: 1,
           data1: 'C3',
@@ -190,23 +273,20 @@ export default function App() {
       setCues(prev => prev.filter(c => c.id !== id));
   };
 
+  const maxTimelineDuration = tracks.length > 0 
+      ? Math.max(...tracks.map(t => t.startTime + t.duration)) 
+      : 0;
+
   return (
     <div className="min-h-screen bg-[#0A0A0B] text-[#E0E0E0] font-sans selection:bg-[#FF4E00]/30 flex flex-col">
-      <audio 
-        ref={audioRef} 
-        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)} 
-        onEnded={stopPlay} 
-        className="hidden" 
-      />
-      
       <header className="flex items-center justify-between px-6 py-4 border-b border-[#2A2A2D] bg-[#121214] sticky top-0 z-50">
         <div className="flex items-center gap-4">
           <div className="w-10 h-10 bg-[#FF4E00] rounded-lg flex items-center justify-center shadow-[0_0_15px_rgba(255,78,0,0.3)]">
             <Music className="w-6 h-6 text-white" />
           </div>
           <div>
-            <h1 className="text-lg font-bold tracking-tight text-white uppercase">SHOW CONSOLE <span className="text-[#666] font-normal ml-2 text-sm">v2.0</span></h1>
-            <p className="text-[10px] text-[#FF4E00] font-mono tracking-widest uppercase">UNIVERSAL MIDI TRIGGER ENGINE</p>
+            <h1 className="text-lg font-bold tracking-tight text-white uppercase">SHOW CONSOLE <span className="text-[#666] font-normal ml-2 text-sm">v3.0</span></h1>
+            <p className="text-[10px] text-[#FF4E00] font-mono tracking-widest uppercase">MULTITRACK TIMELINE ENGINE</p>
           </div>
         </div>
         
@@ -223,9 +303,8 @@ export default function App() {
         
         <div className="flex w-full relative z-10">
           
-          {/* Left Sidebar */}
-          <aside className="w-80 bg-[#121214] border-r border-[#2A2A2D] flex flex-col pt-6 z-20">
-            <div className="px-6 mb-8">
+          <aside className="w-96 bg-[#121214] border-r border-[#2A2A2D] flex flex-col pt-6 z-20">
+            <div className="px-6 mb-6 shrink-0">
                <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest mb-4">MIDI Output Interface</h2>
                {!midiEnabled ? (
                   <button 
@@ -235,44 +314,67 @@ export default function App() {
                     Connect MIDI Subsystem
                   </button>
                ) : (
-                  <div className="space-y-4">
-                      <div>
-                        <label className="text-[10px] text-[#666] uppercase tracking-widest flex items-center mb-2">
-                          Primary Hardware Output
-                        </label>
-                        <select 
-                          value={selectedOutput}
-                          onChange={(e) => setSelectedOutput(e.target.value)}
-                          className="w-full bg-[#1C1C1F] border border-[#2A2A2D] rounded px-3 py-2 text-sm focus:outline-none focus:border-[#FF4E00] transition-colors appearance-none font-mono text-[#E0E0E0] shadow-[inset_0_-1px_0_#2A2A2D]"
-                        >
-                          {outputs.length === 0 && <option value="">No targets detected</option>}
-                          {outputs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
-                        </select>
-                      </div>
+                  <div>
+                    <label className="text-[10px] text-[#666] uppercase tracking-widest flex items-center mb-2">
+                      Primary Hardware Output
+                    </label>
+                    <select 
+                      value={selectedOutput}
+                      onChange={(e) => setSelectedOutput(e.target.value)}
+                      className="w-full bg-[#1C1C1F] border border-[#2A2A2D] rounded px-3 py-2 text-sm focus:outline-none focus:border-[#FF4E00] transition-colors appearance-none font-mono text-[#E0E0E0]"
+                    >
+                      {outputs.length === 0 && <option value="">No targets detected</option>}
+                      {outputs.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
+                    </select>
                   </div>
                )}
             </div>
 
-            <div className="px-6">
-                <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest mb-4">Audio Track</h2>
-                <div className="bg-[#1C1C1F] border border-[#2A2A2D] border-dashed rounded p-4 text-center">
-                   <input type="file" accept="audio/*" onChange={handleFileUpload} className="hidden" id="audio-upload" />
-                   <label htmlFor="audio-upload" className="cursor-pointer flex flex-col items-center">
-                       <Music className="w-6 h-6 text-[#444] mb-2" />
-                       <span className="text-xs font-bold text-[#E0E0E0] tracking-wider mb-1 uppercase">Load Track File</span>
-                       <span className="text-[10px] text-[#666] font-mono">.WAV .MP3 .OGG .FLAC</span>
-                   </label>
+            <div className="px-6 flex-1 flex flex-col min-h-0 overflow-hidden">
+                <div className="flex justify-between items-center mb-4">
+                  <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest">Master Playlist ({tracks.length}/30)</h2>
+                  <input type="file" multiple accept="audio/*" onChange={handleFileUpload} className="hidden" id="audio-upload" disabled={tracks.length >= 30} />
+                  <label htmlFor="audio-upload" className={`cursor-pointer flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest transition-colors ${tracks.length >= 30 ? 'bg-[#2A2A2D] text-[#666] cursor-not-allowed' : 'bg-[#1C1C1F] border border-[#2A2A2D] hover:border-[#FF4E00] text-[#E0E0E0]'}`}>
+                      <Plus className="w-3 h-3" /> Add Tracks
+                  </label>
                 </div>
-                {fileName && (
-                   <div className="mt-4 p-3 bg-[#1C1C1F] border border-[#FF4E00]/50 rounded border-l-2 border-l-[#FF4E00]">
-                       <div className="text-[10px] text-[#FF4E00] mb-1 font-mono">ACTIVE DECK</div>
-                       <div className="text-sm font-bold truncate" title={fileName}>{fileName}</div>
-                   </div>
-                )}
+                
+                <div className="flex-1 overflow-y-auto pr-2 space-y-2">
+                   {tracks.length === 0 ? (
+                      <div className="text-center p-8 border border-dashed border-[#2A2A2D] rounded flex flex-col items-center justify-center text-[#666]">
+                          <FileAudio className="w-6 h-6 mb-2 opacity-50" />
+                          <span className="text-[11px] uppercase tracking-widest">No tracks loaded</span>
+                      </div>
+                   ) : tracks.map((track, i) => (
+                      <div key={track.id} className="bg-[#1C1C1F] border border-[#2A2A2D] rounded p-3 relative group">
+                          <div className="flex justify-between items-start mb-2">
+                             <div className="text-[11px] font-bold truncate pr-6" title={track.name}>{i+1}. {track.name}</div>
+                             <button onClick={() => removeTrack(track.id)} className="absolute top-2 right-2 text-[#666] hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <Trash2 className="w-3.5 h-3.5" />
+                             </button>
+                          </div>
+                          <div className="flex items-center justify-between mt-2 pt-2 border-t border-[#2A2A2D]">
+                             <div className="flex items-center gap-1.5">
+                                <Clock className="w-3 h-3 text-[#FF4E00]" />
+                                <span className="text-[9px] text-[#666] uppercase tracking-widest">Start Time</span>
+                             </div>
+                             <input 
+                                type="text"
+                                defaultValue={formatTime(track.startTime)}
+                                onBlur={(e) => updateTrackStart(track.id, e.target.value)}
+                                className="w-20 bg-[#121214] border border-[#2A2A2D] focus:border-[#FF4E00] text-[#FF4E00] px-1.5 py-0.5 rounded font-mono text-[11px] text-right outline-none"
+                             />
+                          </div>
+                          <div className="text-[9px] text-[#666] font-mono mt-1 text-right">
+                             Duration: {formatTime(track.duration)}
+                          </div>
+                      </div>
+                   ))}
+                </div>
             </div>
 
-            <div className="flex-1 mt-8 min-h-0 relative flex flex-col px-6 pb-6">
-               <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest mb-4">Trigger Log</h2>
+            <div className="h-48 mt-4 shrink-0 relative flex flex-col px-6 pb-6 pt-4 border-t border-[#2A2A2D]">
+               <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest mb-3">Trigger Log</h2>
                <div className="flex-1 overflow-y-auto bg-[#0A0A0B] border border-[#2A2A2D] rounded p-3 font-mono text-[10px] leading-relaxed text-[#AAA] overflow-x-hidden">
                    {logs.map(log => (
                        <div key={log.id} className="mb-0.5 text-[#FF4E00] animate-in fade-in duration-300 truncate">
@@ -284,17 +386,15 @@ export default function App() {
             </div>
           </aside>
 
-          {/* Main Console Area */}
           <section className="flex-1 flex flex-col h-[calc(100vh-4rem-2rem)] overflow-hidden">
              
-             {/* Transport Header */}
              <div className="h-64 border-b border-[#2A2A2D] bg-[#121214] p-8 flex flex-col justify-between shadow-sm relative z-10 shrink-0">
                 <div className="flex items-start justify-between">
                    <div className="flex gap-4">
-                       <button onClick={togglePlay} disabled={!audioSrc} className="w-16 h-16 rounded bg-[#1C1C1F] border border-[#2A2A2D] hover:border-[#FF4E00] hover:text-[#FF4E00] flex items-center justify-center transition-colors disabled:opacity-50 disabled:hover:border-[#2A2A2D]">
+                       <button onClick={togglePlay} className="w-16 h-16 rounded bg-[#1C1C1F] border border-[#2A2A2D] hover:border-[#FF4E00] hover:text-[#FF4E00] flex items-center justify-center transition-colors">
                            {isPlaying ? <Pause className="w-8 h-8" /> : <Play className="w-8 h-8 ml-1" />}
                        </button>
-                       <button onClick={stopPlay} disabled={!audioSrc} className="w-16 h-16 rounded bg-[#1C1C1F] border border-[#2A2A2D] hover:border-[#FF4E00] hover:text-[#FF4E00] flex items-center justify-center transition-colors disabled:opacity-50 disabled:hover:border-[#2A2A2D]">
+                       <button onClick={stopPlay} className="w-16 h-16 rounded bg-[#1C1C1F] border border-[#2A2A2D] hover:border-[#FF4E00] hover:text-[#FF4E00] flex items-center justify-center transition-colors">
                            <Square className="w-6 h-6" />
                        </button>
                    </div>
@@ -302,26 +402,35 @@ export default function App() {
                    <div className="text-right">
                        <div className="text-[10px] text-[#666] tracking-widest uppercase mb-1 font-mono">Master Clock</div>
                        <div className="text-6xl font-black font-mono text-[#E0E0E0] tracking-tighter tabular-nums drop-shadow-[0_0_15px_rgba(255,255,255,0.1)]">
-                           {formatTime(currentTime)}
+                           {formatTime(masterTime)}
                        </div>
                    </div>
                 </div>
 
-                <div className="mt-8 space-y-2">
+                <div className="mt-8 space-y-2 relative">
                    <div className="flex justify-between text-[10px] font-mono text-[#666]">
                        <span>00:00.00</span>
-                       <span>{formatTime(duration)}</span>
+                       <span>{formatTime(Math.max(maxTimelineDuration, 300))}</span>
                    </div>
                    <input 
                       type="range" 
                       min={0} 
-                      max={duration || 100} 
+                      max={Math.max(maxTimelineDuration, 300)} 
                       step="0.001" 
-                      value={currentTime} 
+                      value={masterTime} 
                       onChange={handleSeek} 
-                      disabled={!audioSrc}
-                      className="w-full accent-[#FF4E00] h-3 bg-[#1C1C1F] rounded-full appearance-none cursor-pointer disabled:opacity-50 border border-[#2A2A2D]"
+                      className="w-full z-20 relative accent-[#FF4E00] h-3 bg-[#1C1C1F] rounded-full appearance-none cursor-pointer border border-[#2A2A2D]"
                    />
+                   <div className="absolute left-0 bottom-0 w-full h-3 pointer-events-none rounded-full overflow-hidden">
+                      {tracks.map(t => {
+                         const max = Math.max(maxTimelineDuration, 300);
+                         const left = (t.startTime / max) * 100;
+                         const width = (t.duration / max) * 100;
+                         return (
+                            <div key={t.id} className="absolute h-full bg-[#FF4E00]/30 border-x border-[#FF4E00]" style={{ left: `${left}%`, width: `${width}%` }}></div>
+                         )
+                      })}
+                   </div>
                 </div>
              </div>
 
@@ -329,7 +438,7 @@ export default function App() {
              <div className="flex-1 p-8 overflow-hidden flex flex-col">
                 <div className="bg-[#121214] border border-[#2A2A2D] rounded-xl shadow-xl flex-1 flex flex-col overflow-hidden">
                   <div className="flex justify-between items-center p-4 border-b border-[#2A2A2D] shrink-0 bg-[#17171A]">
-                    <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest">Master Cue List</h2>
+                    <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest">Master Timeline Cues</h2>
                     <button onClick={addCue} className="flex items-center gap-1.5 px-3 py-1.5 bg-[#FF4E00]/10 border border-[#FF4E00]/30 hover:bg-[#FF4E00]/20 rounded text-[11px] font-bold text-[#FF4E00] uppercase tracking-widest transition-colors">
                       <Plus className="w-3.5 h-3.5" /> MARK CUE AT PLAYHEAD
                     </button>
@@ -358,7 +467,7 @@ export default function App() {
                         ) : cues.map(cue => (
                           <tr key={cue.id} className="border-b border-[#2A2A2D] hover:bg-[#1C1C1F] group transition-colors">
                             <td className="p-2">
-                              <input type="number" step="0.001" value={cue.time} onChange={(e)=> updateCue(cue.id, 'time', parseFloat(e.target.value))} className="w-24 bg-transparent border border-transparent focus:border-[#FF4E00] focus:bg-[#121214] text-[#E0E0E0] p-1.5 rounded font-mono text-sm outline-none transition-all" />
+                              <input type="text" value={formatTime(cue.time)} onChange={(e)=> updateCue(cue.id, 'time', parseTime(e.target.value))} className="w-24 bg-transparent border border-transparent focus:border-[#FF4E00] focus:bg-[#121214] text-[#E0E0E0] p-1.5 rounded font-mono text-sm outline-none transition-all" />
                             </td>
                             <td className="p-2">
                               <select value={cue.action} onChange={(e)=> updateCue(cue.id, 'action', e.target.value as any)} className="w-32 bg-[#121214] border border-[#2A2A2D] focus:border-[#FF4E00] text-[#E0E0E0] p-1.5 rounded text-[11px] uppercase outline-none font-bold tracking-widest">
@@ -391,11 +500,10 @@ export default function App() {
         </div>
       </main>
       
-      {/* Footer */}
       <footer className="h-8 bg-[#121214] border-t border-[#2A2A2D] px-6 flex items-center justify-between text-[10px] text-[#666] font-mono tracking-widest uppercase z-50 shrink-0">
         <div className="flex gap-6 opacity-80">
           <div className="flex gap-1.5"><span>V OUT:</span><span className="text-[#AAA]">{vol}%</span></div>
-          <div className="flex gap-1.5"><span>AUDIO ENGINE:</span><span className="text-[#AAA]">HTML5 MEDIA</span></div>
+          <div className="flex gap-1.5"><span>AUDIO ENGINE:</span><span className="text-[#AAA]">MULTITRACK TIMELINE</span></div>
           <div className="flex gap-1.5"><span>MIDI LIB:</span><span className="text-[#AAA]">WEBMIDI.JS</span></div>
         </div>
         <div className="flex items-center gap-4">
