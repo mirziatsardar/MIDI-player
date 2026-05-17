@@ -140,12 +140,22 @@ export default function App() {
               name: file.name,
               url,
               startTime: defaultStart,
-              duration: 0,
+              duration: 100, // Temporary default to allow it to show on timeline until loaded
               audio
           };
           
-          audio.onloadedmetadata = () => {
-              setTracks(prev => prev.map(t => t.id === track.id ? { ...t, duration: t.audio.duration } : t));
+          const handleDuration = () => {
+              if (audio.duration && audio.duration !== Infinity) {
+                  setTracks(prev => prev.map(t => t.id === track.id ? { ...t, duration: audio.duration } : t));
+              }
+          };
+
+          audio.onloadedmetadata = handleDuration;
+          audio.ondurationchange = handleDuration;
+          audio.oncanplay = handleDuration;
+          
+          audio.onerror = (e) => {
+              console.error(`Error loading audio file ${file.name}:`, e);
           };
           
           newTracks.push(track);
@@ -388,7 +398,7 @@ export default function App() {
             <div className="px-6 flex-1 flex flex-col min-h-0 overflow-hidden">
                 <div className="flex justify-between items-center mb-4">
                   <h2 className="text-[11px] font-bold text-[#666] uppercase tracking-widest">Master Playlist ({tracks.length}/30)</h2>
-                  <input type="file" multiple accept="audio/*" onChange={handleFileUpload} className="hidden" id="audio-upload" disabled={tracks.length >= 30} />
+                  <input type="file" multiple accept=".mp3,.wav,.ogg,.flac,.m4a,audio/*" onChange={handleFileUpload} className="hidden" id="audio-upload" disabled={tracks.length >= 30} />
                   <label htmlFor="audio-upload" className={`cursor-pointer flex items-center gap-1.5 px-2 py-1 rounded text-[10px] font-bold uppercase tracking-widest transition-colors ${tracks.length >= 30 ? 'bg-[#2A2A2D] text-[#666] cursor-not-allowed' : 'bg-[#1C1C1F] border border-[#2A2A2D] hover:border-[#FF4E00] text-[#E0E0E0]'}`}>
                       <Plus className="w-3 h-3" /> Add Tracks
                   </label>
