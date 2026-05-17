@@ -43,6 +43,8 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [vol, setVol] = useState<number>(100);
 
+  const [activeTrackId, setActiveTrackId] = useState<string | null>(null);
+  
   const [midiEnabled, setMidiEnabled] = useState<boolean>(false);
   const [outputs, setOutputs] = useState<Output[]>([]);
   const [selectedOutput, setSelectedOutput] = useState<string>('');
@@ -56,6 +58,15 @@ export default function App() {
   const lastTimeRef = useRef<number>(0);
   const lastTickTimeRef = useRef<number>(0);
   const tracksRef = useRef<Track[]>([]);
+  
+  const masterTimeRef = useRef<number>(0);
+  const activeTrackIdRef = useRef<string | null>(null);
+  const isPlayingRef = useRef<boolean>(false);
+  const selectedOutputRef = useRef<string>('');
+
+  useEffect(() => {
+      activeTrackIdRef.current = activeTrackId;
+  }, [activeTrackId]);
 
   useEffect(() => {
      cuesRef.current = cues;
@@ -66,10 +77,21 @@ export default function App() {
   }, [tracks]);
 
   useEffect(() => {
+      selectedOutputRef.current = selectedOutput;
+  }, [selectedOutput]);
+
+  useEffect(() => {
      tracks.forEach(track => {
          track.audio.volume = vol / 100;
      });
   }, [vol, tracks]);
+
+  // Clean up on unmount
+  useEffect(() => {
+    return () => {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+    }
+  }, []);
 
   const initMidi = async () => {
     WebMidi.enable({ sysex: true })
@@ -80,6 +102,7 @@ export default function App() {
         if (WebMidi.outputs.length > 0) {
           setSelectedOutput(WebMidi.outputs[0].id);
         }
+
         WebMidi.addListener('connected', () => setOutputs(WebMidi.outputs));
         WebMidi.addListener('disconnected', () => {
           setOutputs(WebMidi.outputs);
@@ -104,7 +127,8 @@ export default function App() {
 
       // Allow up to 30 tracks
       const remainingSlots = 30 - tracks.length;
-      const filesToProcess = Array.from(files).slice(0, remainingSlots);
+      const filesArray = Array.from(files) as File[];
+      const filesToProcess = filesArray.slice(0, remainingSlots);
 
       filesToProcess.forEach(file => {
           const url = URL.createObjectURL(file);
@@ -145,83 +169,125 @@ export default function App() {
           }
           return prev.filter(t => t.id !== id);
       });
+      
+      if (activeTrackIdRef.current === id) {
+          setActiveTrackId(null);
+          activeTrackIdRef.current = null;
+          setIsPlaying(false);
+          isPlayingRef.current = false;
+          setMasterTime(0);
+          masterTimeRef.current = 0;
+      }
+  };
+
+  const selectTrack = (id: string) => {
+      const track = tracksRef.current.find(t => t.id === id);
+      if (!track) return;
+      
+      setActiveTrackId(id);
+      activeTrackIdRef.current = id;
+      
+      tracksRef.current.forEach(t => {
+          if (t.id !== id) {
+              t.audio.pause();
+              t.audio.currentTime = 0;
+          }
+      });
+      
+      track.audio.currentTime = 0;
+      track.audio.play().catch(e => console.log(e));
+      
+      setIsPlaying(true);
+      isPlayingRef.current = true;
+      setMasterTime(track.startTime);
+      masterTimeRef.current = track.startTime;
+      
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      requestRef.current = requestAnimationFrame(checkTimeline);
   };
 
   const togglePlay = () => {
-      if (isPlaying) {
+      const trackId = activeTrackIdRef.current || tracksRef.current[0]?.id;
+      if (!trackId) return;
+      
+      const activeTrack = tracksRef.current.find(t => t.id === trackId);
+      if (!activeTrack) return;
+      
+      if (!activeTrackIdRef.current) {
+          setActiveTrackId(trackId);
+          activeTrackIdRef.current = trackId;
+      }
+
+      if (isPlayingRef.current) {
+          activeTrack.audio.pause();
           setIsPlaying(false);
-          tracksRef.current.forEach(t => t.audio.pause());
+          isPlayingRef.current = false;
+          if (requestRef.current) cancelAnimationFrame(requestRef.current);
       } else {
           lastTickTimeRef.current = performance.now();
+          activeTrack.audio.play().catch(e => console.log(e));
           setIsPlaying(true);
+          isPlayingRef.current = true;
+          requestRef.current = requestAnimationFrame(checkTimeline);
       }
   };
 
   const stopPlay = () => {
       setIsPlaying(false);
-      setMasterTime(0);
-      lastTimeRef.current = 0;
-      tracksRef.current.forEach(t => {
-          t.audio.pause();
-          t.audio.currentTime = 0;
-      });
+      isPlayingRef.current = false;
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      
+      const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current);
+      if (track) {
+          track.audio.pause();
+          track.audio.currentTime = 0;
+          setMasterTime(track.startTime);
+          masterTimeRef.current = track.startTime;
+      } else {
+          setMasterTime(0);
+          masterTimeRef.current = 0;
+      }
   };
 
   const handleSeek = (e: React.ChangeEvent<HTMLInputElement>) => {
-      const time = parseFloat(e.target.value);
-      setMasterTime(time);
-      lastTimeRef.current = time;
+      const audioTime = parseFloat(e.target.value);
+      const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current);
+      if (!track) return;
       
-      tracksRef.current.forEach(t => {
-          if (time >= t.startTime && time < t.startTime + t.duration) {
-              t.audio.currentTime = time - t.startTime;
-              if (isPlaying) t.audio.play().catch(e => console.log(e));
-          } else {
-              t.audio.pause();
-          }
-      });
+      track.audio.currentTime = audioTime;
+      const newMasterTime = track.startTime + audioTime;
+      
+      setMasterTime(newMasterTime);
+      masterTimeRef.current = newMasterTime;
   };
 
   const checkTimeline = () => {
-      if (!isPlaying) return;
+      if (!isPlayingRef.current || !activeTrackIdRef.current) return;
       
-      const now = performance.now();
-      const delta = (now - lastTickTimeRef.current) / 1000;
-      lastTickTimeRef.current = now;
-      
-      const nextTime = masterTime + delta;
-      
-      // Update Audio playback
-      tracksRef.current.forEach(t => {
-          const isTimeInTrack = nextTime >= t.startTime && nextTime < t.startTime + t.duration;
-          const wasInTrack = masterTime >= t.startTime && masterTime < t.startTime + t.duration;
-          
-          if (isTimeInTrack) {
-              if (t.audio.paused) {
-                  t.audio.currentTime = nextTime - t.startTime;
-                  t.audio.play().catch(e => console.log("Audio play error", e));
-              } else {
-                  // Sync check to prevent drift
-                  const expectedTime = nextTime - t.startTime;
-                  if (Math.abs(t.audio.currentTime - expectedTime) > 0.2) {
-                      t.audio.currentTime = expectedTime;
-                  }
-              }
-          } else if (wasInTrack) {
-              t.audio.pause();
-          }
-      });
+      const track = tracksRef.current.find(t => t.id === activeTrackIdRef.current);
+      if (!track) return;
+
+      if (track.audio.ended) {
+          setIsPlaying(false);
+          isPlayingRef.current = false;
+          setMasterTime(track.startTime + track.duration);
+          return;
+      }
+
+      const currentTime = masterTimeRef.current;
+      const nextTime = track.startTime + track.audio.currentTime;
 
       // Fire MIDI Cues
-      if (WebMidi.enabled && selectedOutput) {
-           const output = WebMidi.getOutputById(selectedOutput);
-           if (output) {
+      if (WebMidi.enabled && selectedOutputRef.current) {
+           const output = WebMidi.getOutputById(selectedOutputRef.current);
+           if (output && nextTime > currentTime) {
                cuesRef.current.forEach(cue => {
-                    if (cue.time > masterTime && cue.time <= nextTime) {
+                    // Trigger if cue time falls strictly within the newly evaluated timeframe
+                    if (cue.time > currentTime && cue.time <= nextTime) {
                          const ch = output.channels[cue.channel];
                          try {
                              if (cue.action === 'noteon') {
-                                 ch.playNote(cue.data1, { rawVelocity: true, velocity: cue.data2 });
+                                 ch.playNote(cue.data1, { rawAttack: cue.data2 });
                              } else if (cue.action === 'cc') {
                                  ch.sendControlChange(Number(cue.data1), cue.data2);
                              }
@@ -237,21 +303,10 @@ export default function App() {
            }
       }
       
+      masterTimeRef.current = nextTime;
       setMasterTime(nextTime);
-      lastTimeRef.current = nextTime;
       requestRef.current = requestAnimationFrame(checkTimeline);
   };
-
-  useEffect(() => {
-      if (isPlaying) {
-          requestRef.current = requestAnimationFrame(checkTimeline);
-      } else {
-          if (requestRef.current) cancelAnimationFrame(requestRef.current);
-      }
-      return () => {
-          if (requestRef.current) cancelAnimationFrame(requestRef.current);
-      }
-  }, [isPlaying, masterTime, selectedOutput]);
 
   const addCue = () => {
       const newCue: MidiCue = {
@@ -273,9 +328,9 @@ export default function App() {
       setCues(prev => prev.filter(c => c.id !== id));
   };
 
-  const maxTimelineDuration = tracks.length > 0 
-      ? Math.max(...tracks.map(t => t.startTime + t.duration)) 
-      : 0;
+  const activeTrack = tracks.find(t => t.id === activeTrackId);
+  const sliderMax = activeTrack ? activeTrack.duration : 0;
+  const sliderValue = activeTrack ? (masterTime - activeTrack.startTime) : 0;
 
   return (
     <div className="min-h-screen bg-[#0A0A0B] text-[#E0E0E0] font-sans selection:bg-[#FF4E00]/30 flex flex-col">
@@ -346,9 +401,16 @@ export default function App() {
                           <span className="text-[11px] uppercase tracking-widest">No tracks loaded</span>
                       </div>
                    ) : tracks.map((track, i) => (
-                      <div key={track.id} className="bg-[#1C1C1F] border border-[#2A2A2D] rounded p-3 relative group">
+                      <div 
+                         key={track.id} 
+                         onDoubleClick={() => selectTrack(track.id)}
+                         className={`bg-[#1C1C1F] border rounded p-3 relative group transition-colors cursor-pointer select-none ${activeTrackId === track.id ? 'border-[#FF4E00]' : 'border-[#2A2A2D] hover:border-[#444]'}`}
+                      >
                           <div className="flex justify-between items-start mb-2">
-                             <div className="text-[11px] font-bold truncate pr-6" title={track.name}>{i+1}. {track.name}</div>
+                             <div className="text-[11px] font-bold truncate pr-6" title={track.name}>
+                                 {i+1}. {track.name}
+                                 {activeTrackId === track.id && <span className="ml-2 text-[9px] text-[#FF4E00] uppercase">Active</span>}
+                             </div>
                              <button onClick={() => removeTrack(track.id)} className="absolute top-2 right-2 text-[#666] hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity">
                                 <Trash2 className="w-3.5 h-3.5" />
                              </button>
@@ -410,26 +472,20 @@ export default function App() {
                 <div className="mt-8 space-y-2 relative">
                    <div className="flex justify-between text-[10px] font-mono text-[#666]">
                        <span>00:00.00</span>
-                       <span>{formatTime(Math.max(maxTimelineDuration, 300))}</span>
+                       <span>{formatTime(sliderMax)}</span>
                    </div>
                    <input 
                       type="range" 
                       min={0} 
-                      max={Math.max(maxTimelineDuration, 300)} 
+                      max={sliderMax || 100} 
                       step="0.001" 
-                      value={masterTime} 
+                      value={Math.max(0, sliderValue)} 
                       onChange={handleSeek} 
-                      className="w-full z-20 relative accent-[#FF4E00] h-3 bg-[#1C1C1F] rounded-full appearance-none cursor-pointer border border-[#2A2A2D]"
+                      disabled={!activeTrack}
+                      className="w-full z-20 relative accent-[#FF4E00] h-3 bg-[#1C1C1F] rounded-full appearance-none cursor-pointer border border-[#2A2A2D] disabled:opacity-50 disabled:cursor-not-allowed"
                    />
                    <div className="absolute left-0 bottom-0 w-full h-3 pointer-events-none rounded-full overflow-hidden">
-                      {tracks.map(t => {
-                         const max = Math.max(maxTimelineDuration, 300);
-                         const left = (t.startTime / max) * 100;
-                         const width = (t.duration / max) * 100;
-                         return (
-                            <div key={t.id} className="absolute h-full bg-[#FF4E00]/30 border-x border-[#FF4E00]" style={{ left: `${left}%`, width: `${width}%` }}></div>
-                         )
-                      })}
+                       <div className="absolute h-full bg-[#FF4E00]/30" style={{ left: 0, width: `${sliderMax > 0 ? (sliderValue / sliderMax) * 100 : 0}%` }}></div>
                    </div>
                 </div>
              </div>
