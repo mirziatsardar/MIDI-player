@@ -1,5 +1,7 @@
 {
   "name": "react-example",
+  "description": "Universal Show Console MIDI Player",
+  "author": "Google AI Studio",
   "private": true,
   "version": "0.0.0",
   "type": "module",
